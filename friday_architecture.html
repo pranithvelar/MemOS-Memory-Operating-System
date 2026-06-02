@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Friday — System Architecture</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #1a1a2e; font-family: 'Inter', 'Segoe UI', sans-serif; overflow-x: auto; min-height: 100vh; }
+
+  h1 { text-align: center; color: #e2e8f0; font-size: 22px; font-weight: 700; padding: 28px 0 8px;
+       letter-spacing: 1px; }
+  .subtitle { text-align: center; color: #64748b; font-size: 13px; margin-bottom: 30px; }
+
+  .canvas { position: relative; width: 1200px; margin: 0 auto; padding-bottom: 60px; }
+
+  /* ── NODE BASE ── */
+  .node {
+    position: absolute;
+    border-radius: 12px;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    text-align: center;
+    cursor: pointer;
+    transition: transform .15s, box-shadow .15s;
+    border: 1.5px solid rgba(255,255,255,.12);
+  }
+  .node:hover { transform: translateY(-3px); box-shadow: 0 12px 32px rgba(0,0,0,.5); }
+  .node .icon { font-size: 22px; margin-bottom: 4px; }
+  .node .label { font-size: 12px; font-weight: 600; color: #f1f5f9; line-height: 1.4; }
+  .node .sub  { font-size: 10px; color: rgba(255,255,255,.55); margin-top: 2px; line-height: 1.3; }
+
+  /* colours */
+  .n-user    { background: linear-gradient(135deg,#334155,#1e293b); width:160px; height:64px; }
+  .n-entry   { background: linear-gradient(135deg,#1d4ed8,#1e40af); width:160px; height:60px; }
+  .n-purple  { background: linear-gradient(135deg,#7c3aed,#6d28d9); width:150px; height:78px; }
+  .n-orange  { background: linear-gradient(135deg,#ea580c,#c2410c); width:150px; height:78px; }
+  .n-teal    { background: linear-gradient(135deg,#0d9488,#0f766e); width:150px; height:78px; }
+  .n-blue    { background: linear-gradient(135deg,#2563eb,#1d4ed8); width:360px; height:64px; }
+  .n-green   { background: linear-gradient(135deg,#16a34a,#15803d); width:300px; height:76px;
+               box-shadow: 0 0 24px rgba(22,163,74,.4); }
+  .n-diamond { background: linear-gradient(135deg,#ca8a04,#a16207); width:130px; height:64px;
+               border-radius: 8px; clip-path: polygon(50% 0%,100% 50%,50% 100%,0% 50%);
+               border:none; }
+  .n-diamond .label { font-size: 11px; }
+  .n-tool    { background: linear-gradient(135deg,#7c3aed,#5b21b6); width:120px; height:66px; border-radius:10px; }
+  .n-dream   { background: linear-gradient(135deg,#0e7490,#155e75); width:140px; height:66px; }
+  .n-promote { background: linear-gradient(135deg,#b45309,#92400e); width:160px; height:72px; }
+  .n-success { background: linear-gradient(135deg,#16a34a,#166534); width:160px; height:60px;
+               box-shadow: 0 0 16px rgba(22,163,74,.35); }
+  .n-store   { background: linear-gradient(135deg,#1e293b,#0f172a); width:130px; height:56px;
+               border: 1.5px solid #334155; border-radius:8px; }
+  .n-promoted{ background: linear-gradient(135deg,#854d0e,#713f12); width:140px; height:60px;
+               box-shadow: 0 0 16px rgba(234,179,8,.3); }
+
+  /* ── SVG ARROWS ── */
+  svg.arrows { position: absolute; top:0; left:0; width:100%; height:100%; pointer-events:none; overflow:visible; }
+  .arrow { stroke: rgba(148,163,184,.5); stroke-width: 1.8; fill: none; marker-end: url(#arr); }
+  .arrow-loop { stroke: rgba(139,92,246,.6); stroke-width: 1.8; fill:none; marker-end: url(#arr-p); stroke-dasharray: 5 3; }
+  .arrow-dream{ stroke: rgba(20,184,166,.5); stroke-width:1.5; fill:none; marker-end: url(#arr-t); stroke-dasharray:4 3;}
+
+  .edge-label {
+    position: absolute; background: #0f172a; color: #94a3b8;
+    font-size: 10px; padding: 2px 6px; border-radius: 4px;
+    border: 1px solid #1e293b; white-space: nowrap; pointer-events:none;
+  }
+
+  /* section labels */
+  .section-label {
+    position: absolute; font-size: 10px; font-weight: 700; letter-spacing: .8px;
+    text-transform: uppercase; color: rgba(255,255,255,.2); pointer-events:none;
+  }
+
+  /* storage column */
+  .storage-col { position: absolute; left: 1020px; top: 160px; display:flex; flex-direction:column; gap:14px; }
+  .storage-col .n-store { position:relative; }
+
+  .legend { display:flex; gap:20px; justify-content:center; margin-top:30px; flex-wrap:wrap; }
+  .leg { display:flex; align-items:center; gap:7px; font-size:11px; color:#94a3b8; }
+  .leg-dot { width:12px; height:12px; border-radius:3px; }
+</style>
+</head>
+<body>
+
+<h1>⚡ Friday — Intelligent Memory System</h1>
+<p class="subtitle">Node architecture · llama3.1:8b · sqlite-vec · OpenClaw promotion scoring</p>
+
+<div class="canvas" style="height:1020px;">
+
+  <!-- SVG arrows -->
+  <svg class="arrows">
+    <defs>
+      <marker id="arr"   markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+        <path d="M0,0 L0,6 L8,3 z" fill="rgba(148,163,184,.7)"/>
+      </marker>
+      <marker id="arr-p" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+        <path d="M0,0 L0,6 L8,3 z" fill="rgba(139,92,246,.8)"/>
+      </marker>
+      <marker id="arr-t" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+        <path d="M0,0 L0,6 L8,3 z" fill="rgba(20,184,166,.7)"/>
+      </marker>
+    </defs>
+
+    <!-- User → entry -->
+    <line class="arrow" x1="520" y1="95"  x2="520" y2="148"/>
+    <!-- entry → row2 -->
+    <path class="arrow" d="M 440,208 Q 330,208 325,248"/>
+    <line class="arrow" x1="520" y1="208" x2="520" y2="248"/>
+    <path class="arrow" d="M 600,208 Q 715,208 715,248"/>
+    <!-- row2 → assemble -->
+    <path class="arrow" d="M 325,326 Q 325,370 400,378"/>
+    <path class="arrow" d="M 520,326 L 520,378"/>
+    <path class="arrow" d="M 715,326 Q 715,370 640,378"/>
+    <!-- assemble → LLM -->
+    <line class="arrow" x1="520" y1="442" x2="520" y2="494"/>
+    <!-- LLM → diamond -->
+    <line class="arrow" x1="520" y1="570" x2="520" y2="622"/>
+    <!-- diamond NO → success -->
+    <path class="arrow" d="M 455,654 Q 340,654 340,714"/>
+    <!-- diamond YES → tools -->
+    <path class="arrow" d="M 585,654 Q 700,654 700,714"/>
+    <!-- tools → LLM loop -->
+    <path class="arrow-loop" d="M 880,750 Q 980,750 980,530 Q 980,494 820,532"/>
+    <!-- write_memory → dream -->
+    <path class="arrow-dream" d="M 760,780 Q 760,840 660,840"/>
+    <!-- dream → promote -->
+    <line class="arrow-dream" x1="590" y1="872" x2="590" y2="908"/>
+    <!-- promote → PROMOTED -->
+    <path class="arrow-dream" d="M 670,940 Q 800,940 870,900"/>
+    <!-- storage lines -->
+    <path class="arrow" stroke-dasharray="3 3" d="M 820,532 Q 1010,520 1045,490"/>
+    <path class="arrow" stroke-dasharray="3 3" d="M 760,746 Q 1010,750 1045,560"/>
+    <path class="arrow" stroke-dasharray="3 3" d="M 330,746 Q 1010,800 1045,630"/>
+    <path class="arrow" stroke-dasharray="3 3" d="M 620,840 Q 1010,850 1045,700"/>
+    <path class="arrow" stroke-dasharray="3 3" d="M 670,940 Q 1010,950 1045,770"/>
+  </svg>
+
+  <!-- ── NODES ── -->
+
+  <!-- User -->
+  <div class="node n-user" style="left:440px;top:31px;">
+    <span class="icon">👤</span>
+    <span class="label">User Input</span>
+  </div>
+
+  <!-- Entry point -->
+  <div class="node n-entry" style="left:440px;top:148px;">
+    <span class="icon">🖥️</span>
+    <span class="label">terminal_chat.py</span>
+    <span class="sub">Entry point · commands</span>
+  </div>
+
+  <!-- Row 2: 3 parallel -->
+  <div class="node n-purple" style="left:250px;top:248px;">
+    <span class="icon">🧬</span>
+    <span class="label">FeedbackDetector</span>
+    <span class="sub">Auto-detect prefs\nfrom message (regex)</span>
+  </div>
+  <div class="node n-orange" style="left:445px;top:248px;">
+    <span class="icon">🗜️</span>
+    <span class="label">_maybe_compact()</span>
+    <span class="sub">Summarise if 20+\nnew messages</span>
+  </div>
+  <div class="node n-teal" style="left:640px;top:248px;">
+    <span class="icon">🔍</span>
+    <span class="label">_pre_search()</span>
+    <span class="sub">Auto-fetch memories\nbefore LLM sees prompt</span>
+  </div>
+
+  <!-- Assemble -->
+  <div class="node n-blue" style="left:340px;top:378px;">
+    <span class="icon">📐</span>
+    <span class="label">_assemble_context() — Token Budget (6 000 tok)</span>
+    <span class="sub">Newest msgs first · summary ≤ 300 tok · current question always fits</span>
+  </div>
+
+  <!-- LLM -->
+  <div class="node n-green" style="left:370px;top:494px;">
+    <span class="icon">🤖</span>
+    <span class="label" style="font-size:14px;">LLM — llama3.1:8b</span>
+    <span class="sub">num_ctx = 8 192 · timeout = 60 s · Ollama local</span>
+  </div>
+
+  <!-- Diamond -->
+  <div class="node n-diamond" style="left:455px;top:622px;">
+    <span class="label">Tool Call?</span>
+  </div>
+
+  <!-- YES / NO labels -->
+  <div class="edge-label" style="left:370px;top:656px;">NO</div>
+  <div class="edge-label" style="left:598px;top:656px;">YES</div>
+
+  <!-- Final response -->
+  <div class="node n-success" style="left:260px;top:714px;">
+    <span class="icon">✅</span>
+    <span class="label">Final Response</span>
+    <span class="sub">→ persisted to session.jsonl</span>
+  </div>
+
+  <!-- Tool nodes -->
+  <div class="node n-tool" style="left:580px;top:714px;">
+    <span class="icon">🔎</span>
+    <span class="label">search_memory</span>
+    <span class="sub">hybrid vector+FTS5</span>
+  </div>
+  <div class="node n-tool" style="left:712px;top:714px;">
+    <span class="icon">💾</span>
+    <span class="label">write_memory</span>
+    <span class="sub">dedup → DB → index</span>
+  </div>
+  <div class="node n-tool" style="left:844px;top:714px;">
+    <span class="icon">🎛️</span>
+    <span class="label">update_preference</span>
+    <span class="sub">→ profile.json</span>
+  </div>
+  <div class="node n-tool" style="left:580px;top:800px;">
+    <span class="icon">📋</span>
+    <span class="label">update_fact</span>
+    <span class="sub">→ profile.json</span>
+  </div>
+  <div class="node n-tool" style="left:712px;top:800px;">
+    <span class="icon">🌙</span>
+    <span class="label">dream_now</span>
+    <span class="sub">manual trigger</span>
+  </div>
+
+  <!-- Result loop label -->
+  <div class="edge-label" style="left:952px;top:660px; color:#a78bfa;">Result → LLM</div>
+  <div class="edge-label" style="left:730px;top:797px; color:#5eead4; font-size:9px;">every 5 writes →</div>
+
+  <!-- Dream pipeline -->
+  <div class="node n-dream" style="left:520px;top:840px;">
+    <span class="icon">💭</span>
+    <span class="label">MemoryDreamer</span>
+    <span class="sub">LLM consolidation → DREAMS.md</span>
+  </div>
+  <div class="node n-promote" style="left:510px;top:908px;">
+    <span class="icon">🏆</span>
+    <span class="label">promote_top_memories()</span>
+    <span class="sub">6-factor scoring · prune stale</span>
+  </div>
+
+  <!-- PROMOTED.md -->
+  <div class="node n-promoted" style="left:830px;top:900px;">
+    <span class="icon">⭐</span>
+    <span class="label">PROMOTED.md</span>
+    <span class="sub">Permanent long-term store</span>
+  </div>
+
+  <!-- STORAGE COLUMN -->
+  <div class="storage-col">
+    <div class="node n-store"><span class="icon" style="font-size:16px;">🗄️</span><span class="label" style="font-size:11px;">memory.db</span><span class="sub">chunks + FTS5 + vec</span></div>
+    <div class="node n-store"><span class="icon" style="font-size:16px;">👤</span><span class="label" style="font-size:11px;">profile.json</span><span class="sub">facts + preferences</span></div>
+    <div class="node n-store"><span class="icon" style="font-size:16px;">📜</span><span class="label" style="font-size:11px;">session.jsonl</span><span class="sub">full history</span></div>
+    <div class="node n-store"><span class="icon" style="font-size:16px;">📊</span><span class="label" style="font-size:11px;">recall.json</span><span class="sub">promotion tracker</span></div>
+    <div class="node n-store"><span class="icon" style="font-size:16px;">💭</span><span class="label" style="font-size:11px;">DREAMS.md</span><span class="sub">consolidated memories</span></div>
+  </div>
+
+  <!-- Section labels -->
+  <div class="section-label" style="left:60px;top:260px;">PREPROCESSING</div>
+  <div class="section-label" style="left:60px;top:500px;">INFERENCE</div>
+  <div class="section-label" style="left:60px;top:730px;">TOOLS</div>
+  <div class="section-label" style="left:60px;top:850px;">DREAMING</div>
+  <div class="section-label" style="left:1020px;top:145px;">STORAGE</div>
+
+</div>
+
+<!-- Legend -->
+<div class="legend">
+  <div class="leg"><div class="leg-dot" style="background:#1d4ed8"></div>Entry / Assembly</div>
+  <div class="leg"><div class="leg-dot" style="background:#7c3aed"></div>Personalisation / Tools</div>
+  <div class="leg"><div class="leg-dot" style="background:#0d9488"></div>Search / Dream</div>
+  <div class="leg"><div class="leg-dot" style="background:#ea580c"></div>Compaction</div>
+  <div class="leg"><div class="leg-dot" style="background:#16a34a"></div>LLM / Success</div>
+  <div class="leg"><div class="leg-dot" style="background:#1e293b; border:1px solid #475569"></div>Persistent Storage</div>
+</div>
+
+</body>
+</html>

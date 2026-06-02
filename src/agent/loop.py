@@ -1,0 +1,535 @@
+import json
+import re
+import os
+import asyncio
+import logging
+from typing import List, Dict, Any, Callable, Optional
+import ollama
+import datetime
+from src.memory.facts import FactStore, extract_facts
+
+LLM_TIMEOUT_SECONDS = 60
+NUM_CTX = 8192  # Sweet spot: 4x Ollama default, negligible latency impact
+
+logger = logging.getLogger(__name__)
+
+# -----------------------------------------------------------------------
+# Token-aware context assembly (inspired by OpenClaw's context engine)
+# -----------------------------------------------------------------------
+# With NUM_CTX=8192, we budget:
+#   System prompt + tools: ~800 tokens (minimized)
+#   Summary (if any):      ~300 tokens
+#   Recent messages:       ~5500 tokens (the MAIN content)
+#   Response headroom:     ~1600 tokens
+# -----------------------------------------------------------------------
+
+MAX_CONTEXT_TOKENS = 6000
+RESPONSE_RESERVE = 1600
+SUMMARY_MAX_TOKENS = 300
+MIN_SUMMARIZE_THRESHOLD = 20
+CHARS_PER_TOKEN = 4
+
+
+def estimate_tokens(text: str) -> int:
+    return max(1, len(text) // CHARS_PER_TOKEN)
+
+
+def estimate_message_tokens(msg: Dict[str, str]) -> int:
+    return estimate_tokens(msg.get("content", "")) + 4
+
+
+class FeedbackDetector:
+    PATTERNS = [
+        (r'(?:call me|address me as|my name is|i am)\s+([\w]+)', 'address_as', 1),
+        (r'(?:be more|be)\s+(concise|brief|short|verbose|detailed|formal|casual|friendly)', 'response_style', 1),
+        (r'(?:keep.+(?:short|brief|concise))', 'response_style', 'concise'),
+        (r'(?:too long|too verbose|shorten)', 'response_style', 'concise'),
+        (r'(?:be more|sound more)\s+(serious|funny|playful|warm|professional|chill)', 'tone', 1),
+        (r"(?:don'?t use)\s+(?:emojis?)", 'use_emojis', 'no'),
+        (r'(?:use)\s+(?:emojis?)', 'use_emojis', 'yes'),
+    ]
+
+    def __init__(self, personalization):
+        self.personalization = personalization
+        self._compiled = [(re.compile(p, re.IGNORECASE), k, v) for p, k, v in self.PATTERNS]
+
+    def detect_and_save(self, user_message: str) -> list:
+        if not self.personalization:
+            return []
+        saved = []
+        for pattern, pref_key, value_spec in self._compiled:
+            match = pattern.search(user_message)
+            if match:
+                value = match.group(value_spec) if isinstance(value_spec, int) else value_spec
+                value = value.strip()
+                current = self.personalization.get_preference(pref_key)
+                if current != value:
+                    self.personalization.update_preference(pref_key, value)
+                    saved.append((pref_key, value))
+        return saved
+
+
+SYSTEM_PROMPT = """You are Friday, a highly intelligent, formal, and concise personal AI assistant with persistent memory.
+
+CRITICAL INTELLIGENCE RULES:
+1. [ABSOLUTE CONTINUOUS ITINERARY] is YOUR internal awareness - NEVER list it unless explicitly asked "what's my schedule".
+2. Use [Memory context] to answer smartly but NEVER repeat it back.
+3. Answer ONLY the current question. Keep responses 1-2 sentences.
+4. NEVER mention tags, tools, warnings, or that you are an AI.
+5. EXECUTOR: When user asks to DO something, output tool JSON immediately.
+6. LEARNING: Silently save stable facts/preferences with tools. No confirmation messages.
+7. If [SYSTEM WARNING] about conflicts exists, mention it ONCE briefly ("You have overlapping events on June 4th").
+{user_rules}
+
+To use a tool, output ONLY a JSON block:
+```json
+{{"name": "tool_name", "arguments": {{"arg": "val"}}}}
+```
+Then STOP.
+
+Tools:
+{tools_schema}
+"""
+
+
+class AgentLoop:
+    def __init__(self, workspace_dir: str = "", model: str = "llama3.1:8b", session_manager=None,
+                 session_id: str = "default", personalization=None, db_manager=None):
+        self.workspace_dir = workspace_dir
+        self.db_manager = db_manager
+        self.fact_store = FactStore(db_manager) if db_manager else None
+        self.model = model
+        self.tools: Dict[str, Callable] = {}
+        self.tools_schemas: List[Dict[str, Any]] = []
+        self.session_manager = session_manager
+        self.session_id = session_id
+        self.personalization = personalization
+        # FeedbackDetector is kept as a lightweight fallback for instant patterns
+        # but LLM auto-tooling now handles the majority of preference learning.
+        self.feedback_detector = FeedbackDetector(personalization) if personalization else None
+        self._status_callback = None
+        self._history: List[Dict[str, str]] = []
+        self._history_loaded = False
+        self._summary_cache: str = ""
+        self._compacted_up_to: int = 0
+        self._reflect_at: int = 0  # tracks when next Reflection should run
+        self._searcher = None  # injected by terminal_chat for pre-search
+
+    def register_tool(self, name: str, func: Callable, schema: Dict[str, Any]):
+        self.tools[name] = func
+        self.tools_schemas.append(schema)
+
+    def _build_system_prompt(self) -> str:
+        tools_brief = []
+        for s in self.tools_schemas:
+            params = s.get("parameters", {}).get("properties", {})
+            param_list = ", ".join(f'{k}: {v.get("type","str")}' for k, v in params.items())
+            tools_brief.append(f'- {s["name"]}({param_list}): {s.get("description","")[:80]}')
+        tools_str = "\n".join(tools_brief)
+
+        user_rules = ""
+        if self.personalization:
+            prefs = self.personalization.profile.get("preferences", {})
+            rules = []
+            if prefs.get("address_as"):
+                rules.append(f'- Address the user as "{prefs["address_as"]}".')
+            if prefs.get("response_style") == "concise":
+                rules.append("- Be very concise.")
+            if prefs.get("tone"):
+                rules.append(f"- Use a {prefs['tone']} tone.")
+            if prefs.get("use_emojis") == "no":
+                rules.append("- No emojis.")
+            if rules:
+                user_rules = "\n".join(rules) + "\n"
+                
+        # Fetch precise timezone-aware time to prevent Windows OS clock drift
+        local_now = datetime.datetime.now(datetime.timezone.utc).astimezone()
+        now_str = local_now.strftime("%A, %B %d, %Y, %I:%M %p %Z").strip()
+        time_injection = f"\nCURRENT SYSTEM TIME: {now_str}\n"
+
+        return SYSTEM_PROMPT.format(tools_schema=tools_str, user_rules=user_rules) + time_injection
+
+    def _load_history(self):
+        if self._history_loaded or not self.session_manager:
+            return
+        prior = self.session_manager.load_session(self.session_id)
+        if prior:
+            self._history = prior
+        self._load_summary_cache()
+        self._history_loaded = True
+
+    def _persist(self, role: str, content: str):
+        msg = {"role": role, "content": content}
+        self._history.append(msg)
+        if self.session_manager:
+            self.session_manager.append_message(self.session_id, role, content)
+
+    def _get_summary_key(self) -> str:
+        return f"summary:{self.session_id}"
+
+    def _load_summary_cache(self):
+        if not self.db_manager:
+            return
+        try:
+            conn = self.db_manager.get_connection()
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = ?", (self._get_summary_key(),)
+            ).fetchone()
+            if row:
+                self._summary_cache = row["value"][:SUMMARY_MAX_TOKENS * CHARS_PER_TOKEN]
+                if self._summary_cache:
+                    self._compacted_up_to = max(0, len(self._history) - 10)
+        except Exception:
+            pass
+
+    def _save_summary_cache(self, summary: str):
+        self._summary_cache = summary[:SUMMARY_MAX_TOKENS * CHARS_PER_TOKEN]
+        if not self.db_manager:
+            return
+        try:
+            conn = self.db_manager.get_connection()
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                (self._get_summary_key(), self._summary_cache)
+            )
+            conn.commit()
+        except Exception:
+            pass
+
+    def _status(self, msg: str):
+        if self._status_callback:
+            self._status_callback(msg)
+
+    async def _llm_call(self, messages: list) -> str:
+        try:
+            client = ollama.AsyncClient()
+            response = await asyncio.wait_for(
+                client.chat(
+                    model=self.model,
+                    messages=messages,
+                    options={"num_ctx": NUM_CTX}
+                ),
+                timeout=LLM_TIMEOUT_SECONDS
+            )
+            return response['message']['content']
+        except asyncio.TimeoutError:
+            raise asyncio.TimeoutError(f"LLM timed out after {LLM_TIMEOUT_SECONDS}s")
+
+    def _assemble_context(self, user_message: str) -> List[Dict[str, str]]:
+        """Token-aware context assembly. Current question always fits."""
+        system_prompt = self._build_system_prompt()
+        user_msg_tokens = estimate_tokens(user_message) + 4
+        budget = MAX_CONTEXT_TOKENS - user_msg_tokens
+
+        messages = [{"role": "system", "content": system_prompt}]
+
+        summary_tokens = 0
+        if self._summary_cache:
+            summary_tokens = min(estimate_tokens(self._summary_cache), SUMMARY_MAX_TOKENS)
+
+        history_budget = budget - summary_tokens
+        recent_msgs = []
+        tokens_used = 0
+
+        for msg in reversed(self._history):
+            msg_tokens = estimate_message_tokens(msg)
+            if tokens_used + msg_tokens > history_budget:
+                break
+            recent_msgs.append(msg)
+            tokens_used += msg_tokens
+
+        recent_msgs.reverse()
+
+        if self._summary_cache and summary_tokens > 0:
+            messages.append({
+                "role": "user",
+                "content": f"[Previous context: {self._summary_cache}]"
+            })
+            messages.append({
+                "role": "assistant",
+                "content": "Got it."
+            })
+
+        messages.extend(recent_msgs)
+        messages.append({"role": "user", "content": user_message})
+        return messages
+
+    async def _maybe_compact(self):
+        """Compact only when enough new messages accumulate."""
+        total = len(self._history)
+        uncompacted = total - self._compacted_up_to
+        if uncompacted < MIN_SUMMARIZE_THRESHOLD:
+            return
+
+        self._status("Summarizing older context...")
+        keep_recent = 8
+        old_end = max(self._compacted_up_to, total - keep_recent)
+        old_messages = self._history[self._compacted_up_to:old_end]
+        if not old_messages:
+            return
+
+        content_lines = []
+        if self._summary_cache:
+            content_lines.append(f"Previous: {self._summary_cache}")
+        for msg in old_messages[-15:]:
+            role = msg.get("role", "?")
+            text = msg.get("content", "")[:150]
+            content_lines.append(f"[{role}]: {text}")
+
+        try:
+            summary = await self._llm_call([
+                {"role": "system", "content": "Summarize in 3-4 bullet points. Keep facts, names, preferences. Be extremely concise. Output ONLY bullets."},
+                {"role": "user", "content": "\n".join(content_lines)}
+            ])
+            self._save_summary_cache(summary.strip())
+            self._compacted_up_to = old_end
+        except Exception as e:
+            logger.warning(f"Compaction failed: {e}")
+
+    def _fix_json_keys(self, text: str) -> str:
+        fixed = re.sub(r'(\{|,)\s*(\w+)\s*:', r'\1 "\2":', text)
+        for tn in self.tools.keys():
+            fixed = re.sub(rf'"name"\s*:\s*{re.escape(tn)}', f'"name": "{tn}"', fixed)
+        return fixed
+
+    def _extract_action(self, text: str) -> Optional[Dict[str, Any]]:
+        if "```json" in text:
+            try:
+                json_str = text.split("```json")[-1].split("```")[0].strip()
+                json_str = self._fix_json_keys(json_str)
+                parsed = json.loads(json_str)
+                if isinstance(parsed, dict) and "name" in parsed:
+                    return parsed
+            except Exception:
+                pass
+
+        if "{" in text and "name" in text:
+            depth = 0
+            start = -1
+            for i, c in enumerate(text):
+                if c == '{':
+                    if depth == 0:
+                        start = i
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0 and start >= 0:
+                        candidate = text[start:i+1]
+                        try:
+                            fixed = self._fix_json_keys(candidate)
+                            parsed = json.loads(fixed)
+                            if isinstance(parsed, dict) and "name" in parsed:
+                                return parsed
+                        except Exception:
+                            pass
+                        start = -1
+        return None
+
+    async def _pre_search(self, user_message: str) -> str:
+        """Auto-search memory before every response — proactive conflict detection."""
+        if not self._searcher:
+            return ""
+        try:
+            results = await self._searcher.search(
+                user_message, vector_weight=0.5, text_weight=0.5, max_results=4
+            )
+            if not results:
+                return ""
+            lines = []
+            for r in results:
+                snippet = r.snippet[:200] if r.snippet else ""
+                lines.append(f"- {snippet}")
+            return "[Memory context]\n" + "\n".join(lines)
+        except Exception as e:
+            logger.warning(f"Pre-search failed: {e}")
+            return ""
+
+    async def _maybe_reflect(self):
+        """Background Reflection agent: every 12 messages, silently scans chat history
+        for new stable facts/preferences and autonomously saves them."""
+        total = len(self._history)
+        if total < self._reflect_at + 12:
+            return
+        if not self.personalization:
+            return
+
+        self._reflect_at = total
+        recent = self._history[-14:]
+        if not recent:
+            return
+
+        content_lines = []
+        for msg in recent:
+            role = msg.get("role", "?")
+            text = msg.get("content", "")[:200]
+            content_lines.append(f"[{role}]: {text}")
+
+        reflection_prompt = (
+            "Analyze the following conversation. Extract ONLY deliberate, stable personal facts "
+            "or preferences expressed by the user. Ignore one-time emotional states. "
+            "Output ONLY a compact JSON array like: "
+            '[{{"type":"fact","key":"occupation","value":"designer"}}, '
+            '{{"type":"preference","key":"tone","value":"casual"}}]. '
+            "If nothing stable was revealed, output an empty array []."
+            "\n\nConversation:\n" + "\n".join(content_lines)
+        )
+
+        try:
+            import json as _json
+            result_text = await self._llm_call([
+                {"role": "system", "content": "You are a silent observer extracting stable user attributes from conversation logs. Output ONLY valid JSON."},
+                {"role": "user", "content": reflection_prompt}
+            ])
+            # Extract JSON from response
+            text = result_text.strip()
+            if "[" in text:
+                text = text[text.index("["):text.rindex("]")+1]
+            items = _json.loads(text)
+            for item in items:
+                t = item.get("type", "")
+                key = item.get("key", "").strip()
+                value = item.get("value", "").strip()
+                if not key or not value:
+                    continue
+                if t == "fact":
+                    self.personalization.update_fact(key, value)
+                    logger.info(f"[Reflection] Saved fact: {key}={value}")
+                elif t == "preference":
+                    self.personalization.update_preference(key, value)
+                    logger.info(f"[Reflection] Saved preference: {key}={value}")
+        except Exception as e:
+            logger.debug(f"Reflection agent failed silently: {e}")
+
+    async def run(self, user_message: str, max_steps: int = 5) -> str:
+        self._load_history()
+
+        # FeedbackDetector: still handles instant, obvious patterns (name, emojis)
+        # The LLM auto-tooling (LEARNING PROTOCOL rule) handles everything natural
+        if self.feedback_detector:
+            self.feedback_detector.detect_and_save(user_message)
+
+        await self._maybe_compact()
+        
+        # Background Reflection: silently learns from conversation every 12 messages
+        await self._maybe_reflect()
+
+        # Auto-search memory BEFORE LLM call — injects relevant memories as context
+        memory_context = await self._pre_search(user_message)
+        
+        # EXTRACT FACTS AND CHECK CONFLICTS
+        active_facts_context = ""
+        system_conflict_warning = ""
+        if self.fact_store:
+            # 1. Extract ops blind to context
+            extraction_res = extract_facts(user_message)
+            ops = extraction_res.get("operations", [])
+
+            # Apply ops safely behind the scenes
+            for op in ops:
+                try:
+                    if op.get("action") == "add" and op.get("content") and op.get("date_start"):
+                        start_dt = datetime.datetime.fromisoformat(op["date_start"])
+                        end_dt = datetime.datetime.fromisoformat(op["date_end"]) if op.get("date_end") else start_dt
+                        self.fact_store.add_fact(
+                            op["content"], 
+                            start_dt, 
+                            end_dt,
+                            float(op.get("importance", 0.5))
+                        )
+                    elif op.get("action") == "delete" and op.get("keyword"):
+                        self.fact_store.delete_fact(op["keyword"])
+                except Exception as e:
+                    logger.warning(f"Error applying fact operation {op}: {e}")
+
+            # 2. Run the offline mathematical linter
+            self.fact_store.lint_memory_conflicts()
+            
+            # 3. Check for open contested items — only warn if urgent (within 2 days)
+            contested = self.fact_store.get_contested_facts()
+            urgent_contested = []
+            if contested:
+                now_dt = datetime.datetime.now()
+                for f in contested:
+                    try:
+                        ds = datetime.datetime.fromisoformat(f["date_start"]).replace(tzinfo=None)
+                        days_until = (ds.date() - now_dt.date()).days
+                        if 0 <= days_until <= 2:
+                            urgent_contested.append(f)
+                    except BaseException:
+                        pass
+
+            if urgent_contested:
+                lines = []
+                for f in urgent_contested:
+                    try:
+                        f_date = datetime.datetime.fromisoformat(f["date_start"]).strftime("%A, %b %d")
+                        lines.append(f"- {f_date}: {f['content']}")
+                    except BaseException:
+                        pass
+                if lines:
+                    system_conflict_warning = "[SYSTEM WARNING: You have CONFLICTING events in the next 2 days that need resolving:]\n" + "\n".join(lines) + "\n"
+
+            # Always show active schedule but ONLY if upcoming events exist
+            current_active = self.fact_store.get_active_facts(upcoming_days=7)
+            if current_active:
+                lines = []
+                for f in current_active:
+                    try:
+                        f_date = datetime.datetime.fromisoformat(f["date_start"]).strftime("%a %b %d")
+                        lines.append(f"- {f_date}: {f['content']}")
+                    except BaseException:
+                        pass
+                if lines:
+                    active_facts_context = "[ITINERARY]\n" + "\n".join(lines) + "\n"
+
+        # Prepend memory context to the user message so the LLM always sees it
+        augmented_message = user_message
+        context_parts = []
+        if active_facts_context:
+            context_parts.append(active_facts_context)
+        if system_conflict_warning:
+            context_parts.append(system_conflict_warning)
+        if memory_context:
+            context_parts.append(memory_context)
+            
+        if context_parts:
+            augmented_message = "\n".join(context_parts) + f"\nUser: {user_message}"
+
+        messages = self._assemble_context(augmented_message)
+
+        self._persist("user", user_message)  # Persist original (not augmented)
+        self._status("Generating response...")
+
+        for step in range(max_steps):
+            try:
+                content = await self._llm_call(messages)
+                messages.append({"role": "assistant", "content": content})
+
+                action = self._extract_action(content)
+                if not action:
+                    self._persist("assistant", content)
+                    return content
+
+                self._persist("assistant", content)
+                tool_name = action.get("name")
+                tool_args = action.get("arguments", {})
+
+                if tool_name in self.tools:
+                    try:
+                        result = await self.tools[tool_name](**tool_args)
+                        result_msg = f"Result: {result}"
+                    except Exception as e:
+                        result_msg = f"Result: Tool {tool_name} failed: {e}"
+                else:
+                    result_msg = f"Result: Tool '{tool_name}' not found. Available: {list(self.tools.keys())}"
+
+                self._persist("user", result_msg)
+                messages.append({"role": "user", "content": result_msg})
+
+            except asyncio.TimeoutError:
+                return "Response timed out. Please try again."
+            except Exception as e:
+                logger.error(f"Step {step} error: {type(e).__name__}: {e}")
+                return f"Error: {type(e).__name__}. Please try again."
+
+        return "Max reasoning steps reached."

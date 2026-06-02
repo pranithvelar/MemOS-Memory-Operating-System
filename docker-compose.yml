@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  memory-engine:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./workspace:/app/workspace
+    environment:
+      - MEMORY_SYSTEM_CONFIG=/app/workspace/config.json
+      # Ensures the Ollama client routes to the sidecar container
+      - OLLAMA_HOST=http://ollama:11434
+    depends_on:
+      - ollama
+
+  ollama:
+    image: ollama/ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # Note: On first run, you will need to `docker exec` into this and run:
+    # ollama pull llama3.1:8b
+    # ollama pull nomic-embed-text
+
+volumes:
+  ollama_data:
