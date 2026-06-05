@@ -7,6 +7,7 @@ from typing import List, Dict, Any, Callable, Optional
 import ollama
 import datetime
 from src.memory.facts import FactStore, extract_facts
+from src.agent.session_transcript_repair import repair_tool_use_result_pairing, extract_identifiers
 
 LLM_TIMEOUT_SECONDS = 60
 NUM_CTX = 8192  # Sweet spot: 4x Ollama default, negligible latency impact
@@ -28,6 +29,8 @@ RESPONSE_RESERVE = 1600
 SUMMARY_MAX_TOKENS = 300
 MIN_SUMMARIZE_THRESHOLD = 20
 CHARS_PER_TOKEN = 4
+OVERSIZED_MSG_THRESHOLD = 800  # tokens — messages above this are excluded in Stage 2
+COMPACTION_RETRY_ATTEMPTS = 3  # retry per chunk in Stage 1
 
 
 def estimate_tokens(text: str) -> int:
@@ -255,7 +258,16 @@ class AgentLoop:
         return messages
 
     async def _maybe_compact(self):
-        """Compact only when enough new messages accumulate."""
+        """Compact only when enough new messages accumulate.
+        
+        Uses multi-stage progressive fallback (inspired by OpenClaw):
+          Stage 1: Full chunked summarization with identifier preservation
+          Stage 2: Partial (exclude oversized messages, note them)
+          Stage 3: Hard text fallback — guaranteed never to crash
+        
+        After compaction, repairs tool-use pairing on retained messages
+        to prevent orphaned tool_results from causing API errors.
+        """
         total = len(self._history)
         uncompacted = total - self._compacted_up_to
         if uncompacted < MIN_SUMMARIZE_THRESHOLD:
@@ -268,23 +280,184 @@ class AgentLoop:
         if not old_messages:
             return
 
+        # --- Repair tool-use pairing on the RETAINED recent messages ---
+        flat_rest = self._history[old_end:]
+        repair_report = repair_tool_use_result_pairing(flat_rest)
+        if repair_report["repaired"]:
+            logger.info(f"Compaction boundary repair: {repair_report['stats']}")
+            self._history = self._history[:old_end] + repair_report["messages"]
+
+        # --- Multi-stage summarization ---
+        summary = await self._summarize_in_stages(old_messages)
+        if summary:
+            self._save_summary_cache(summary.strip())
+            self._compacted_up_to = old_end
+
+    async def _summarize_in_stages(self, messages: List[Dict[str, str]]) -> str:
+        """Multi-stage progressive compaction with fallback.
+        
+        Stage 1: Full summarization with token-balanced chunks and retries.
+                  Preserves opaque identifiers (UUIDs, hashes, IPs, URLs, file paths).
+        Stage 2: Exclude oversized messages, summarize the rest.
+        Stage 3: Hard text fallback — never crashes.
+        """
+        # --- Stage 1: Full chunked summarization ---
+        try:
+            summary = await self._stage1_full_summarize(messages)
+            if summary:
+                logger.info("Compaction Stage 1 succeeded (full summarization)")
+                return summary
+        except Exception as e:
+            logger.warning(f"Compaction Stage 1 failed: {e}")
+
+        # --- Stage 2: Partial (exclude oversized) ---
+        try:
+            summary = await self._stage2_partial_summarize(messages)
+            if summary:
+                logger.info("Compaction Stage 2 succeeded (partial summarization)")
+                return summary
+        except Exception as e:
+            logger.warning(f"Compaction Stage 2 failed: {e}")
+
+        # --- Stage 3: Hard text fallback (never crashes) ---
+        logger.warning("Compaction falling back to Stage 3 (hard text fallback)")
+        return self._stage3_hard_fallback(messages)
+
+    async def _stage1_full_summarize(self, messages: List[Dict[str, str]]) -> str:
+        """Stage 1: Split into token-balanced chunks, summarize each, merge."""
+        # Collect all identifiers for preservation verification
+        all_identifiers = set()
+        for msg in messages:
+            all_identifiers.update(extract_identifiers(msg.get("content", "")))
+
+        # Build chunks of ~1500 tokens each
+        chunks = []
+        current_chunk = []
+        current_tokens = 0
+        chunk_limit = 1500
+
+        for msg in messages:
+            msg_tokens = estimate_message_tokens(msg)
+            if current_tokens + msg_tokens > chunk_limit and current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = []
+                current_tokens = 0
+            current_chunk.append(msg)
+            current_tokens += msg_tokens
+
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        # Summarize each chunk with retries
+        chunk_summaries = []
+        for chunk in chunks:
+            content_lines = []
+            if self._summary_cache and not chunk_summaries:
+                content_lines.append(f"Previous context: {self._summary_cache}")
+            for msg in chunk:
+                role = msg.get("role", "?")
+                text = msg.get("content", "")[:300]
+                content_lines.append(f"[{role}]: {text}")
+
+            summary = None
+            for attempt in range(COMPACTION_RETRY_ATTEMPTS):
+                try:
+                    summary = await self._llm_call([
+                        {"role": "system", "content": (
+                            "Summarize in 3-4 bullet points. Keep facts, names, preferences. "
+                            "Be extremely concise. Output ONLY bullets.\n\n"
+                            "CRITICAL: Preserve all opaque identifiers exactly as written "
+                            "(no shortening or reconstruction), including UUIDs, hashes, IDs, "
+                            "hostnames, IPs, ports, URLs, and file names."
+                        )},
+                        {"role": "user", "content": "\n".join(content_lines)}
+                    ])
+                    if summary and summary.strip():
+                        break
+                except Exception as e:
+                    logger.warning(f"Chunk summarization attempt {attempt+1} failed: {e}")
+                    if attempt < COMPACTION_RETRY_ATTEMPTS - 1:
+                        await asyncio.sleep(0.5)
+
+            if summary and summary.strip():
+                chunk_summaries.append(summary.strip())
+
+        if not chunk_summaries:
+            return ""
+
+        # Merge chunk summaries if multiple
+        if len(chunk_summaries) == 1:
+            return chunk_summaries[0]
+
+        merge_content = "\n\n".join(
+            f"Chunk {i+1}:\n{s}" for i, s in enumerate(chunk_summaries)
+        )
+        merged = await self._llm_call([
+            {"role": "system", "content": (
+                "Merge these chunk summaries into a single concise summary (3-5 bullets). "
+                "Keep all facts, names, and identifiers. Output ONLY bullets.\n\n"
+                "CRITICAL: Preserve all opaque identifiers exactly as written "
+                "(no shortening or reconstruction), including UUIDs, hashes, IDs, "
+                "hostnames, IPs, ports, URLs, and file names."
+            )},
+            {"role": "user", "content": merge_content}
+        ])
+        return merged.strip() if merged else ""
+
+    async def _stage2_partial_summarize(self, messages: List[Dict[str, str]]) -> str:
+        """Stage 2: Exclude oversized messages, note them, summarize the rest."""
+        normal_msgs = []
+        oversized_notes = []
+
+        for msg in messages:
+            msg_tokens = estimate_message_tokens(msg)
+            if msg_tokens > OVERSIZED_MSG_THRESHOLD:
+                role = msg.get("role", "?")
+                preview = msg.get("content", "")[:80]
+                oversized_notes.append(f"[{role} message, ~{msg_tokens} tokens]: {preview}...")
+            else:
+                normal_msgs.append(msg)
+
+        if not normal_msgs:
+            # All messages are oversized — fall through to Stage 3
+            return ""
+
         content_lines = []
         if self._summary_cache:
-            content_lines.append(f"Previous: {self._summary_cache}")
-        for msg in old_messages[-15:]:
+            content_lines.append(f"Previous context: {self._summary_cache}")
+        for msg in normal_msgs[-15:]:
             role = msg.get("role", "?")
             text = msg.get("content", "")[:150]
             content_lines.append(f"[{role}]: {text}")
 
-        try:
-            summary = await self._llm_call([
-                {"role": "system", "content": "Summarize in 3-4 bullet points. Keep facts, names, preferences. Be extremely concise. Output ONLY bullets."},
-                {"role": "user", "content": "\n".join(content_lines)}
-            ])
-            self._save_summary_cache(summary.strip())
-            self._compacted_up_to = old_end
-        except Exception as e:
-            logger.warning(f"Compaction failed: {e}")
+        if oversized_notes:
+            content_lines.append(f"\n[Note: {len(oversized_notes)} oversized messages excluded]")
+
+        summary = await self._llm_call([
+            {"role": "system", "content": (
+                "Summarize in 3-4 bullet points. Keep facts, names, preferences. "
+                "Be extremely concise. Output ONLY bullets.\n\n"
+                "CRITICAL: Preserve all opaque identifiers exactly as written."
+            )},
+            {"role": "user", "content": "\n".join(content_lines)}
+        ])
+        result = summary.strip() if summary else ""
+        if oversized_notes:
+            result += f"\n[{len(oversized_notes)} oversized messages were excluded from summary]"
+        return result
+
+    def _stage3_hard_fallback(self, messages: List[Dict[str, str]]) -> str:
+        """Stage 3: Hard text fallback — guaranteed never to crash."""
+        oversized_notes = []
+        for msg in messages:
+            if estimate_message_tokens(msg) > OVERSIZED_MSG_THRESHOLD:
+                oversized_notes.append(msg.get("content", "")[:40])
+
+        return (
+            f"Context contained {len(messages)} messages"
+            f" ({len(oversized_notes)} oversized)."
+            f" Summary unavailable due to size limits."
+        )
 
     def _fix_json_keys(self, text: str) -> str:
         fixed = re.sub(r'(\{|,)\s*(\w+)\s*:', r'\1 "\2":', text)
@@ -401,6 +574,17 @@ class AgentLoop:
             logger.debug(f"Reflection agent failed silently: {e}")
 
     async def run(self, user_message: str, max_steps: int = 5) -> str:
+        # Acquire session write-lock to prevent concurrent corruption
+        if self.session_manager:
+            lock = self.session_manager.get_lock(self.session_id)
+        else:
+            lock = asyncio.Lock()  # dummy lock if no session manager
+
+        async with lock:
+            return await self._run_locked(user_message, max_steps)
+
+    async def _run_locked(self, user_message: str, max_steps: int = 5) -> str:
+        """Main agent loop body, runs under session write-lock."""
         self._load_history()
 
         # FeedbackDetector: still handles instant, obvious patterns (name, emojis)

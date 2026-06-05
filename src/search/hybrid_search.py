@@ -178,6 +178,13 @@ class HybridSearcher:
         max_results: int = 10,
         source_filters: List[str] = None
     ) -> List[HybridSearchResult]:
+        try:
+            vector_weight = float(vector_weight)
+            text_weight = float(text_weight)
+            min_score = float(min_score)
+            max_results = int(max_results)
+        except (ValueError, TypeError):
+            pass
         source_filters = source_filters or ["memory", "sessions", "wiki"]
         
         # 1. Try Redis cache first

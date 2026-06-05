@@ -222,6 +222,10 @@ class ToolSystem:
 
     async def _tool_search_memory(self, searcher, query: str, limit: int = 5):
         try:
+            try:
+                limit = int(limit)
+            except (ValueError, TypeError):
+                limit = 5
             # searcher.search() returns List[HybridSearchResult] objects (not dicts)
             results = await searcher.search(query, vector_weight=0.5, text_weight=0.5, max_results=limit)
             if not results:
@@ -359,7 +363,7 @@ class ToolSystem:
         auto_dream_msg = ""
         if self._write_count % 5 == 0 and self.dreamer:
             try:
-                dream_result = self.dreamer.dream_sync()
+                dream_result = self.dreamer.dream_sync(self.db_manager)
                 if dream_result:
                     auto_dream_msg = f" (Auto-dream triggered)"
                     from src.memory.promotion import promote_top_memories, prune_stale_entries
@@ -390,7 +394,7 @@ class ToolSystem:
         if not self.dreamer:
             return "Dreaming pipeline not available."
         try:
-            result = self.dreamer.dream_sync()
+            result = self.dreamer.dream_sync(self.db_manager)
             response = result if result else "No memories to consolidate yet."
 
             from src.memory.promotion import promote_top_memories, prune_stale_entries
