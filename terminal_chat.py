@@ -79,7 +79,7 @@ async def main():
         print(f"[OK] Pruned {pruned} stale recall entries")
         
     try:
-        await groom_facts(db_manager, embedder)
+        await groom_facts(db_manager, embedder, workspace_dir=workspace)
         print("[OK] Groomed expired temporal facts")
     except Exception as e:
         print(f"[WARN] Failed to groom facts: {e}")

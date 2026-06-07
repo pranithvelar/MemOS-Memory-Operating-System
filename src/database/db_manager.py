@@ -117,10 +117,17 @@ class MemoryDatabaseManager:
                 importance REAL DEFAULT 0.5,
                 confidence REAL DEFAULT 1.0,
                 status TEXT DEFAULT 'active',
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                reminder_sent TEXT DEFAULT NULL
             )
             """
         )
+        # Safe migration: add reminder_sent to existing databases that predate this column
+        try:
+            cursor.execute("ALTER TABLE facts ADD COLUMN reminder_sent TEXT DEFAULT NULL")
+            self.conn.commit()
+        except Exception:
+            pass  # Column already exists — no-op
 
         # ── NEW: Short-term recall tracking (replaces short-term-recall.json) ──
         cursor.execute(

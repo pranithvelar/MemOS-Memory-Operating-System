@@ -603,6 +603,7 @@ class AgentLoop:
         # EXTRACT FACTS AND CHECK CONFLICTS
         active_facts_context = ""
         system_conflict_warning = ""
+        reminder_context = ""
         if self.fact_store:
             # 1. Extract ops blind to context
             extraction_res = extract_facts(user_message)
@@ -627,48 +628,105 @@ class AgentLoop:
 
             # 2. Run the offline mathematical linter
             self.fact_store.lint_memory_conflicts()
-            
-            # 3. Check for open contested items — only warn if urgent (within 2 days)
+
+            # 3. Warn about ALL contested future events — no urgency gate.
+            #    Every conflict matters, whether it's tomorrow or 4 months out.
             contested = self.fact_store.get_contested_facts()
-            urgent_contested = []
             if contested:
                 now_dt = datetime.datetime.now()
+                lines = []
                 for f in contested:
                     try:
                         ds = datetime.datetime.fromisoformat(f["date_start"]).replace(tzinfo=None)
                         days_until = (ds.date() - now_dt.date()).days
-                        if 0 <= days_until <= 2:
-                            urgent_contested.append(f)
-                    except BaseException:
-                        pass
-
-            if urgent_contested:
-                lines = []
-                for f in urgent_contested:
-                    try:
-                        f_date = datetime.datetime.fromisoformat(f["date_start"]).strftime("%A, %b %d")
-                        lines.append(f"- {f_date}: {f['content']}")
-                    except BaseException:
+                        if days_until < 0:
+                            continue  # already expired, skip
+                        if days_until == 0:
+                            label = "TODAY"
+                        elif days_until == 1:
+                            label = "TOMORROW"
+                        else:
+                            label = f"{days_until} days away"
+                        f_date = ds.strftime("%a %b %d")
+                        lines.append(f"- {f_date} ({label}): {f['content']}")
+                    except Exception:
                         pass
                 if lines:
-                    system_conflict_warning = "[SYSTEM WARNING: You have CONFLICTING events in the next 2 days that need resolving:]\n" + "\n".join(lines) + "\n"
+                    system_conflict_warning = (
+                        "[SYSTEM WARNING: CONFLICTING EVENTS DETECTED — "
+                        "these events have overlapping times and must be resolved:]\n"
+                        + "\n".join(lines) + "\n"
+                    )
 
-            # Always show active schedule but ONLY if upcoming events exist
-            current_active = self.fact_store.get_active_facts(upcoming_days=7)
+            # 4. Build the full infinite-horizon itinerary with countdown labels.
+            #    The LLM sees ALL future events and how many days remain —
+            #    rule #1 in the system prompt keeps it silent unless asked.
+            current_active = self.fact_store.get_active_facts()  # no day cap
             if current_active:
+                now_dt = datetime.datetime.now()
                 lines = []
                 for f in current_active:
                     try:
-                        f_date = datetime.datetime.fromisoformat(f["date_start"]).strftime("%a %b %d")
-                        lines.append(f"- {f_date}: {f['content']}")
-                    except BaseException:
+                        ds = datetime.datetime.fromisoformat(f["date_start"]).replace(tzinfo=None)
+                        de = datetime.datetime.fromisoformat(f["date_end"]).replace(tzinfo=None)
+                        days_until = (ds.date() - now_dt.date()).days
+
+                        if days_until < 0:
+                            continue  # ongoing but started earlier — still show
+                        elif days_until == 0:
+                            day_label = f"TODAY {ds.strftime('%I:%M %p')}-{de.strftime('%I:%M %p')}"
+                        elif days_until == 1:
+                            day_label = f"TOMORROW {ds.strftime('%I:%M %p')}"
+                        else:
+                            day_label = f"{ds.strftime('%a %b %d')} ({days_until} days away)"
+
+                        lines.append(f"- {day_label}: {f['content']}")
+                    except Exception:
                         pass
                 if lines:
-                    active_facts_context = "[ITINERARY]\n" + "\n".join(lines) + "\n"
+                    active_facts_context = (
+                        "[ABSOLUTE CONTINUOUS ITINERARY — ALL UPCOMING EVENTS]\n"
+                        + "\n".join(lines) + "\n"
+                    )
+
+            # 5. Day-before reminder — inject a prominent block for events
+            #    starting in the next 20-48 hours that haven't been reminded yet.
+            #    Unlike the silent itinerary, the LLM IS expected to mention this.
+            reminder_context = ""
+            if self.fact_store:
+                try:
+                    reminder_events = self.fact_store.get_events_needing_reminder()
+                    if reminder_events:
+                        reminder_lines = []
+                        for rev in reminder_events:
+                            try:
+                                ds = datetime.datetime.fromisoformat(rev["date_start"]).replace(tzinfo=None)
+                                de = datetime.datetime.fromisoformat(rev["date_end"]).replace(tzinfo=None)
+                                now_dt = datetime.datetime.now()
+                                hours_until = max(0, int((ds - now_dt).total_seconds() // 3600))
+                                reminder_lines.append(
+                                    f"- {ds.strftime('%A %b %d at %I:%M %p')} "
+                                    f"(in ~{hours_until} hours): {rev['content']}"
+                                )
+                                # Mark as reminded so this never fires again for this event
+                                self.fact_store.mark_reminder_sent(rev["id"])
+                            except Exception:
+                                pass
+                        if reminder_lines:
+                            reminder_context = (
+                                "[\U0001f514 REMINDER — UPCOMING TOMORROW]\n"
+                                "These events start within the next 24-48 hours. "
+                                "Proactively mention this to the user.\n"
+                                + "\n".join(reminder_lines) + "\n"
+                            )
+                except Exception as e:
+                    logger.warning(f"Reminder check failed: {e}")
 
         # Prepend memory context to the user message so the LLM always sees it
         augmented_message = user_message
         context_parts = []
+        if reminder_context:                  # 🔔 Reminders first — highest priority
+            context_parts.append(reminder_context)
         if active_facts_context:
             context_parts.append(active_facts_context)
         if system_conflict_warning:
