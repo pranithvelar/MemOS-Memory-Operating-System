@@ -117,6 +117,15 @@ async def main():
     loop._searcher = searcher  # enables proactive memory cross-reference on every message
     print(f"[OK] Agent loop ready ({config.llama_model}) — proactive memory enabled")
 
+    # Start Background Worker
+    from BACKGROUND_WORKER.scheduler import BackgroundScheduler
+    from BACKGROUND_WORKER.proactive_events import ProactiveEventsWatcher
+    from BACKGROUND_WORKER.google_workspace import GoogleWorkspaceWatcher
+    bg_scheduler = BackgroundScheduler(db_manager, config)
+    bg_scheduler.register_watcher(ProactiveEventsWatcher(workspace))
+    bg_scheduler.register_watcher(GoogleWorkspaceWatcher())
+    asyncio.create_task(bg_scheduler.run())
+
     # Memory stats
     try:
         conn = db_manager.get_connection()
@@ -145,7 +154,9 @@ async def main():
 
     while True:
         try:
-            user_input = input("You: ").strip()
+            print("You: ", end="", flush=True)
+            event_loop = asyncio.get_event_loop()
+            user_input = (await event_loop.run_in_executor(None, sys.stdin.readline)).strip()
             if not user_input:
                 continue
 
