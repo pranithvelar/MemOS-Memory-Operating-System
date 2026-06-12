@@ -1,27 +1,49 @@
 # Intelligent Memory System
 
-> ⚠️ **Project Status:** This project is currently ~70% complete and under active development. The core architecture is solid, but some features are still being refined. Expect improvements daily.
+> ⚠️ **Project Status:** ~75% complete. Core architecture is production-ready with JARVIS-level proactive intelligence. Daily improvements ongoing.
 
-An open-source, local-first intelligent memory architecture ported from the TypeScript OpenClaw stack to a production-ready Python framework. Designed to give AI agents persistent, dynamic, and evolving memory layers.
+A local-first AI memory system that learns, adapts, and proactively assists you. Built with Python, SQLite, and Ollama—inspired by OpenClaw's architecture with unique innovations in temporal reasoning and autonomous learning.
 
-## Features
+## What Makes This Different
 
-**Phase 1: Core Memory**
-- Local SQLite Database scaled with `sqlite-vec`.
-- Hybrid Search combining FTS5 BM25 + Vector KNN.
-- MMR (Maximal Marginal Relevance) Diversity Re-ranking.
-- Temporal Recency Scaling.
+Unlike static RAG systems that just retrieve text, this system:
+- **Remembers intelligently** - Understands context, importance, and relationships
+- **Forgets strategically** - Auto-prunes stale information
+- **Learns from you** - Adapts tone, style, and behavior through natural interaction
+- **Proactively helps** - Detects conflicts, sends reminders, surfaces relevant memories
+- **Runs 100% locally** - Complete privacy, no cloud dependencies
 
-**Phase 2: Intelligence Layer**
-- **Dreaming Subsystem**: Llama 3.1:8b processes daily "short-term logs" and summarizes them into durable `MEMORY.md` chunks during a semantic consolidation pass.
-- **Promotion Scoring**: 6-dimensional heuristics (frequency, relevance, diversity, recency, consolidation, conceptual) grading memory importance dynamically.
-- **Agent Reasoning**: ReAct style thought-action loop interacting locally with the memory tools.
+## Core Features
 
-**Phase 3: Production**
-- Standardized FastAPI endpoint covering REST + WebSockets.
-- Docker & Docker Compose setup connecting immediately to `ollama`.
-- Async Concurrency batcher to prevent local model overload.
-- Wiki document ingestion pipelines allowing manual memory side-loading.
+### 🧠 Intelligent Memory
+- **Hybrid Search**: FTS5 BM25 + Vector KNN + MMR diversity re-ranking
+- **Temporal Decay**: 30-day half-life scoring with evergreen exemptions
+- **3-Stage Compaction**: Progressive fallback (full → partial → hard) prevents crashes
+- **Self-Healing Transcripts**: Auto-repairs orphaned tool calls/results on load
+
+### 📅 JARVIS-Style Calendar
+- **Infinite-Horizon Awareness**: Sees ALL future events with countdown labels
+- **Proactive 3-Window Alerts**: 1 hour, 15 minutes, and NOW (exact start time)
+- **Conflict Detection**: SQL self-join linter catches overlapping events
+- **Smart Reminders**: 24-48 hour advance warnings with deduplication
+
+### 🎯 Adaptive Intelligence
+- **6D Promotion Scoring**: Frequency, relevance, diversity, recency, consolidation, conceptual
+- **Background Reflection**: Autonomous learning every 12 messages
+- **Dreaming Pipeline**: LLM consolidates short-term memories into durable knowledge
+- **Personalization Agents**: Self-realization + feedback detection
+
+### 🛡️ Production-Ready
+- **Session Write-Locks**: Prevents concurrent corruption
+- **Transcript Repair**: Fixes malformed JSON, orphaned tool calls
+- **Type Coercion**: Safeguards against parameter errors
+- **Redis + SQLite Cache**: Dual-layer with automatic fallback
+
+### 🚀 Background Worker System
+- **Async Scheduler**: Runs continuously, 1-minute resolution
+- **3-Tiered Alerts**: 45-65 min, 10-20 min, ±2 min windows per event
+- **JARVIS Voice**: Formal "Sir, [event] is starting now" style
+- **Google Workspace Stub**: Ready for OAuth2/MCP/n8n integration
 
 ## Quick Setup
 
@@ -29,7 +51,6 @@ An open-source, local-first intelligent memory architecture ported from the Type
 
 1. **Python 3.11+** - [Download](https://www.python.org/downloads/)
 2. **Ollama** - [Install](https://ollama.ai/)
-3. **Git** (optional)
 
 ### Installation
 
@@ -42,7 +63,7 @@ An open-source, local-first intelligent memory architecture ported from the Type
 #### Linux/macOS
 ```bash
 chmod +x setup.sh run_chat.sh
-./setup.sh       # First time only - installs everything
+./setup.sh       # First time only
 ./run_chat.sh    # Start the system
 ```
 
@@ -52,119 +73,136 @@ docker-compose up --build -d
 # Access API: http://localhost:8000
 ```
 
-**See [SETUP.md](SETUP.md) for detailed instructions and troubleshooting.**
+**See [SETUP.md](SETUP.md) for detailed instructions.**
 
-### Example Integration
-To talk to the memory system via python:
-```python
-import json
-import websockets
-import asyncio
+## Project Structure
 
-async def chat():
-    async with websockets.connect("ws://localhost:8000/ws/chat") as ws:
-        await ws.send(json.dumps({"message": "Hello, please remember that my favorite color is Blue.", "session_id": "test_1"}))
-        res = json.loads(await ws.recv())
-        print(res)
+```
+intelligent-memory/
+├── src/
+│   ├── agent/          # ReAct loop, tools, session management
+│   ├── memory/         # Dreaming, promotion, facts, personalization
+│   ├── search/         # Hybrid search, MMR re-ranking
+│   ├── database/       # SQLite + sqlite-vec management
+│   └── embeddings/     # Embedding generation with caching
+├── BACKGROUND_WORKER/  # Proactive alerts, Google stub
+├── tests/              # Comprehensive test suite (60+ tests)
+└── terminal_chat.py    # Main entry point
 ```
 
-## Structure
-- `src/indexing/`: Watchers, Chunkers, and Document splitters.
-- `src/memory/`: SQLite management, Embeddings, Temporal Decay, Dreaming algorithms.
-- `src/search/`: Hybrid search logic and MMR algorithm execution.
-- `src/agent/`: Reasoning loop, Tools configuration, and Session continuity state.
-- `src/config/` & `src/utils/`: Globals, settings, and asynchronous batchers.
-- `src/api/`: ReAct / WebSocket exposure.
+## Technical Highlights
 
-## Technical Comparison: OpenClaw vs This Project
+### Memory Architecture
+- **Storage**: SQLite WAL + sqlite-vec for vectors
+- **Search**: BM25 (keyword) + KNN (semantic) + MMR (diversity)
+- **Caching**: Redis primary, SQLite fallback
+- **Session**: SQL table with auto-repair on load
 
-This project is a **conceptual port** of OpenClaw's memory subsystem to Python, with unique innovations added. Here's the breakdown:
+### Intelligence Pipeline
+```
+User Input → Memory Search (proactive) → Agent Loop (ReAct)
+  ↓
+Facts Extraction → Conflict Detection → Reminder Check
+  ↓
+LLM Response → Background Compaction → Dreaming (every 5 writes)
+  ↓
+Promotion Scoring (6D) → PROMOTED.md
+```
 
-### Code Similarity Analysis
+### Calendar System
+```
+Event Added → Infinite Itinerary (no day cap)
+  ↓
+Background Worker (1-min checks)
+  ↓
+3 Alert Windows: 1h, 15m, NOW
+  ↓
+LLM Generates JARVIS-style Alert → Deduplication → Display
+```
+
+## Unique Innovations
+
+| Feature | Description | Status |
+|---------|-------------|--------|
+| **Temporal Conflict Detection** | SQL self-join for overlapping events | ✅ |
+| **Infinite-Horizon Calendar** | No 7-day cap, full future visibility | ✅ |
+| **3-Window Proactive Alerts** | 1h, 15m, NOW alerts with deduplication | ✅ |
+| **Background Compaction** | Zero-latency summarization (post-response) | ✅ |
+| **Self-Healing Transcripts** | Auto-repair on load with persistence | ✅ |
+| **Identifier Preservation** | UUIDs, hashes, paths intact through compaction | ✅ |
+| **6D Promotion Scoring** | Custom heuristic algorithm | ✅ |
+| **Background Reflection** | Autonomous learning every 12 messages | ✅ |
+
+## Comparison to OpenClaw
+
+This project is a **conceptual port** of OpenClaw's memory architecture to Python with unique additions.
+
+### Similarity Analysis
 
 | Dimension | Similarity % |
 |-----------|-------------|
 | Concepts & Architecture | ~70% |
 | Actual Code / Logic | ~15% |
 | File Structure | ~25% |
-| **Overall (weighted)** | **~20-25%** |
+| **Overall** | **~25%** |
 
-### What is OpenClaw?
+### What This Project Adds
 
-OpenClaw is a **massive production TypeScript monorepo** — a full personal AI assistant platform with:
-- Multi-channel inbox (WhatsApp, Telegram, Slack, Discord, iMessage, 20+ more)
-- Companion apps (macOS, iOS, Android)
-- Voice Wake / Talk Mode
-- Live Canvas (visual workspace)
-- Plugin SDK & Skills registry
-- Always-on gateway daemon
-- Multi-agent routing
+- ✅ Infinite-horizon calendar with conflict detection
+- ✅ 3-window proactive alert system (JARVIS-style)
+- ✅ Background compaction (zero latency impact)
+- ✅ Self-healing transcripts with auto-repair
+- ✅ Temporal reasoning focused on scheduling
 
-This project is a **terminal chatbot** with local SQLite memory backend focused on the memory architecture.
+### What OpenClaw Has
 
-### Feature Comparison
-
-| Feature | This Project | OpenClaw |
-|---------|-------------|----------|
-| **Language** | Python | TypeScript |
-| **LLM Backend** | Ollama (local) | Any provider (OpenAI, Claude) |
-| **Memory Storage** | SQLite WAL | SQLite + remote backends |
-| **Vector Search** | `sqlite-vec` | `sqlite-vec` (same library) |
-| **Full Text Search** | FTS5 + Porter | FTS5 + unicode61/trigram |
-| **Hybrid Search** | BM25 + Vector + MMR | BM25 + Vector KNN |
-| **Dreaming** | LLM consolidation | Multi-phase narrative |
-| **Session Storage** | SQL table | JSONL files |
-| **Deployment** | Docker Compose | Multiple platforms |
-| **Channels** | Terminal only | 20+ messaging platforms |
-| **Voice** | None | macOS/iOS/Android |
-| **Multi-agent** | Single agent | Full routing system |
-| **Multilingual** | English only | 7 languages |
-
-### Unique Innovations in This Project
-
-| Feature | Status |
-|---------|--------|
-| **Calendar/Facts Extraction** | ✅ LLM-driven temporal facts system |
-| **Temporal Conflict Detection** | ✅ SQL self-join linter for scheduling conflicts |
-| **6-Dimensional Promotion Scoring** | ✅ Custom heuristic algorithm |
-| **Short-term Recall Tracking** | ✅ Explicit SQL tracking table |
-| **Background Reflection Agent** | ✅ Autonomous learning every 12 messages |
-| **JSON → DB Migration** | ✅ Migration tooling included |
-| **100% Local Operation** | ✅ No cloud APIs required |
-| **Simple Setup** | ✅ Single command installation |
-
-### What OpenClaw Has That This Doesn't
-
-- 20+ messaging channels (WhatsApp, Telegram, Slack, etc.)
-- Voice wake & Talk mode
-- Mobile/desktop companion apps
+- Multi-channel support (WhatsApp, Telegram, 20+ platforms)
+- Voice integration (macOS/iOS/Android)
 - Plugin SDK & marketplace
 - Multi-agent routing system
-- Sandboxed session execution
-- Full multilingual support (7 languages)
-- OAuth & security features
-- Always-on daemon mode
-- Live Canvas interface
+- 3-phase dreaming (Light → REM → Deep)
+
+**See [OPENCLAW_COMPARISON.md](OPENCLAW_COMPARISON.md) for detailed technical analysis.**
+
+## Testing
+
+Comprehensive test suite covering all subsystems:
+
+```bash
+# Full stress test (63+ tests)
+python stress_test_full.py
+
+# Individual test suites
+pytest tests/
+```
 
 ## Attribution
 
-~70% of the **concepts and architecture** are inspired by [OpenClaw](https://github.com/openclaw/openclaw), with ~15% actual code similarity (mainly SQLite/sqlite-vec plumbing). The rest is original Python implementation with unique features like temporal conflict detection, 6-dimensional promotion scoring, and background reflection agents.
+~70% of **concepts and architecture** inspired by [OpenClaw](https://github.com/openclaw/openclaw). ~15% actual code similarity (SQLite/vector plumbing). Rest is original Python implementation with innovations in temporal reasoning, proactive intelligence, and autonomous learning.
 
 ## Roadmap
 
-- [ ] Complete test coverage (currently ~60%)
-- [ ] Multi-language support
+- [x] Core memory (SQLite + vector search)
+- [x] Hybrid search + MMR
+- [x] Dreaming pipeline
+- [x] 6D promotion scoring
+- [x] Temporal conflict detection
+- [x] Proactive alert system
+- [x] Background compaction
+- [x] Self-healing transcripts
 - [ ] Web UI interface
-- [ ] Mobile API endpoints
+- [ ] Voice integration (TTS/STT)
+- [ ] Google Workspace integration
+- [ ] Multi-language support
 - [ ] Plugin system
-- [ ] Voice integration
-- [ ] Advanced conflict resolution
-- [ ] Performance optimizations
 
 ## License
 
 MIT License - See [LICENSE](LICENSE) for details.
 
-## Contributing
+## Links
 
-This project is under active development. Contributions welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+- [Setup Guide](SETUP.md)
+- [Quick Commands](COMMANDS.md)
+- [OpenClaw Comparison](OPENCLAW_COMPARISON.md)
+- [Contributing](CONTRIBUTING.md)

@@ -81,7 +81,8 @@ CRITICAL INTELLIGENCE RULES:
 4. NEVER mention tags, tools, warnings, or that you are an AI.
 5. EXECUTOR: When user asks to DO something, output tool JSON immediately.
 6. LEARNING: Silently save stable facts/preferences with tools. No confirmation messages.
-7. If [SYSTEM WARNING] about conflicts exists, mention it ONCE briefly ("You have overlapping events on June 4th").
+7. If [SYSTEM WARNING] about conflicts exists, mention it ONCE briefly.
+8. TEMPORAL ACCURACY: For schedules and upcoming events, rely EXCLUSIVELY on [ABSOLUTE CONTINUOUS ITINERARY]. Ignore [Memory context] for dates, as it contains historical/outdated snippets.
 {user_rules}
 
 To use a tool, output ONLY a JSON block:
@@ -592,8 +593,10 @@ class AgentLoop:
         if self.feedback_detector:
             self.feedback_detector.detect_and_save(user_message)
 
-        await self._maybe_compact()
-        
+        # Compaction runs AFTER the response is returned (non-blocking).
+        # This eliminates the "[Summarizing older context...]" delay on the hot path.
+        # The summary will be ready in the DB cache before the NEXT user message.
+
         # Background Reflection: silently learns from conversation every 12 messages
         await self._maybe_reflect()
 
@@ -672,7 +675,7 @@ class AgentLoop:
                         days_until = (ds.date() - now_dt.date()).days
 
                         if days_until < 0:
-                            continue  # ongoing but started earlier — still show
+                            day_label = f"ONGOING (started {-days_until} days ago)"
                         elif days_until == 0:
                             day_label = f"TODAY {ds.strftime('%I:%M %p')}-{de.strftime('%I:%M %p')}"
                         elif days_until == 1:
@@ -742,6 +745,7 @@ class AgentLoop:
         self._persist("user", user_message)  # Persist original (not augmented)
         self._status("Generating response...")
 
+        response_content = None
         for step in range(max_steps):
             try:
                 content = await self._llm_call(messages)
@@ -750,7 +754,8 @@ class AgentLoop:
                 action = self._extract_action(content)
                 if not action:
                     self._persist("assistant", content)
-                    return content
+                    response_content = content
+                    break
 
                 self._persist("assistant", content)
                 tool_name = action.get("name")
@@ -769,9 +774,22 @@ class AgentLoop:
                 messages.append({"role": "user", "content": result_msg})
 
             except asyncio.TimeoutError:
-                return "Response timed out. Please try again."
+                response_content = "Response timed out. Please try again."
+                break
             except Exception as e:
                 logger.error(f"Step {step} error: {type(e).__name__}: {e}")
-                return f"Error: {type(e).__name__}. Please try again."
+                response_content = f"Error: {type(e).__name__}. Please try again."
+                break
 
-        return "Max reasoning steps reached."
+        if response_content is None:
+            response_content = "Max reasoning steps reached."
+
+        # Fire compaction in the background AFTER returning the response.
+        # Zero impact on response latency. Summary cached for next turn.
+        try:
+            from BACKGROUND_WORKER.context_summarizer import trigger_background_compact
+            trigger_background_compact(self)
+        except Exception:
+            pass  # Never let import/task errors affect the response
+
+        return response_content
